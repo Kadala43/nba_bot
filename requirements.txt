@@ -1,0 +1,5 @@
+python-telegram-bot==20.3
+requests
+pandas
+scikit-learn
+nba_api
