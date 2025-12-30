@@ -4,7 +4,13 @@ import datetime
 import logging
 import requests
 import pandas as pd
-from nba_api.stats.endpoints import leaguegamefinder
+from nba_api.stats.endpoints import (
+    leaguegamefinder,
+    playergamelog,
+    playerdashboardbygeneralsplits,
+    teamdashboardbygeneralsplits,
+)
+from nba_api.stats.static import players
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -19,40 +25,45 @@ logger = logging.getLogger(__name__)
 # --- Config ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
-EDGE_THRESHOLD = 3  # min edge to show OVER/UNDER recommendation
+EDGE_THRESHOLD = 3  # edge to show OVER/UNDER
 
 # --- Global caches ---
 odds_cache = {"data": None, "timestamp": 0}
 prediction_cache = {}
-predictions_log = {}  # store predictions and evaluation results
+predictions_log = {}  # store predictions + evaluation
 
 # --- Build Models ---
 def build_models():
     logger.info("Building models from historical game data...")
-    gamefinder = leaguegamefinder.LeagueGameFinder(league_id_nullable='00')
+    gamefinder = leaguegamefinder.LeagueGameFinder(league_id_nullable="00")
     games = gamefinder.get_data_frames()[0]
-    games['GAME_DATE'] = pd.to_datetime(games['GAME_DATE'])
-    games = games[games['GAME_DATE'].dt.year >= 2023]
+    games["GAME_DATE"] = pd.to_datetime(games["GAME_DATE"])
+    games = games[games["GAME_DATE"].dt.year >= 2023]
 
-    avg_scores = games.groupby('TEAM_ID')['PTS'].mean().to_dict()
-    games_home = games[games['MATCHUP'].str.contains('vs.')].copy()
-    games_away = games[games['MATCHUP'].str.contains('@')].copy()
-    merged = pd.merge(games_home, games_away, on='GAME_ID', suffixes=('_HOME', '_AWAY'))
+    avg_scores = games.groupby("TEAM_ID")["PTS"].mean().to_dict()
+    games_home = games[games["MATCHUP"].str.contains("vs.")].copy()
+    games_away = games[games["MATCHUP"].str.contains("@")].copy()
+    merged = pd.merge(games_home, games_away, on="GAME_ID", suffixes=("_HOME", "_AWAY"))
 
-    merged['HOME_AVG'] = merged['TEAM_ID_HOME'].map(avg_scores)
-    merged['AWAY_AVG'] = merged['TEAM_ID_AWAY'].map(avg_scores)
-    merged['TOTAL_SCORE'] = merged['PTS_HOME'] + merged['PTS_AWAY']
-    merged['HOME_WIN'] = (merged['PTS_HOME'] > merged['PTS_AWAY']).astype(int)
+    merged["HOME_AVG"] = merged["TEAM_ID_HOME"].map(avg_scores)
+    merged["AWAY_AVG"] = merged["TEAM_ID_AWAY"].map(avg_scores)
+    merged["TOTAL_SCORE"] = merged["PTS_HOME"] + merged["PTS_AWAY"]
+    merged["HOME_WIN"] = (merged["PTS_HOME"] > merged["PTS_AWAY"]).astype(int)
 
     totals_model = RandomForestRegressor(n_estimators=120, random_state=42)
-    totals_model.fit(merged[['HOME_AVG', 'AWAY_AVG']], merged['TOTAL_SCORE'])
+    totals_model.fit(merged[["HOME_AVG", "AWAY_AVG"]], merged["TOTAL_SCORE"])
 
     winner_model = RandomForestClassifier(n_estimators=240, random_state=42)
-    winner_model.fit(merged[['HOME_AVG', 'AWAY_AVG']], merged['HOME_WIN'])
+    winner_model.fit(merged[["HOME_AVG", "AWAY_AVG"]], merged["HOME_WIN"])
 
-    team_map = games[['TEAM_ID', 'TEAM_NAME']].drop_duplicates().set_index('TEAM_NAME')['TEAM_ID'].to_dict()
+    team_map = (
+        games[["TEAM_ID", "TEAM_NAME"]]
+        .drop_duplicates()
+        .set_index("TEAM_NAME")["TEAM_ID"]
+        .to_dict()
+    )
 
-    logger.info("Models ready: totals regressor + winner classifier.")
+    logger.info("Models ready.")
     return totals_model, winner_model, avg_scores, team_map
 
 totals_model, winner_model, avg_scores, team_map = build_models()
@@ -82,7 +93,7 @@ def fetch_vegas_odds():
     logger.info("Fetched %d games from Odds API", len(data))
     return data
 
-# --- Predictions ---
+# --- Game Predictions ---
 def get_total_prediction(home_team, away_team):
     key = (home_team, away_team)
     if key in prediction_cache:
@@ -91,7 +102,7 @@ def get_total_prediction(home_team, away_team):
     h_id = team_map.get(home_team)
     a_id = team_map.get(away_team)
     if not h_id or not a_id:
-        logger.warning("Team not found in team_map: %s vs %s", home_team, away_team)
+        logger.warning("Unknown team(s): %s vs %s", home_team, away_team)
         return None
 
     h_avg = avg_scores.get(h_id, 110)
@@ -104,9 +115,7 @@ def get_winner_prediction(home_team, away_team):
     h_id = team_map.get(home_team)
     a_id = team_map.get(away_team)
     if not h_id or not a_id:
-        logger.warning("Team not found for winner prediction: %s vs %s", home_team, away_team)
         return None
-
     h_avg = avg_scores.get(h_id, 110)
     a_avg = avg_scores.get(a_id, 110)
     probs = winner_model.predict_proba([[h_avg, a_avg]])[0]
@@ -114,22 +123,87 @@ def get_winner_prediction(home_team, away_team):
     winner = home_team if home_prob > away_prob else away_team
     return winner, home_prob, away_prob
 
-# --- Helpers for results ---
+# --- Results Helpers ---
 def fetch_finished_games_for_date(date_obj):
-    gamefinder = leaguegamefinder.LeagueGameFinder(league_id_nullable='00')
+    gamefinder = leaguegamefinder.LeagueGameFinder(league_id_nullable="00")
     games = gamefinder.get_data_frames()[0]
-    games['GAME_DATE'] = pd.to_datetime(games['GAME_DATE'])
-    return games[games['GAME_DATE'].dt.date == date_obj].copy()
+    games["GAME_DATE"] = pd.to_datetime(games["GAME_DATE"])
+    return games[games["GAME_DATE"].dt.date == date_obj].copy()
 
 def compute_actuals_for_matchup(df_day, home_team, away_team):
-    rows = df_day[(df_day['TEAM_NAME'] == home_team) | (df_day['TEAM_NAME'] == away_team)]
-    if rows.empty or rows['GAME_ID'].nunique() == 0:
+    rows = df_day[(df_day["TEAM_NAME"] == home_team) | (df_day["TEAM_NAME"] == away_team)]
+    if rows.empty or rows["GAME_ID"].nunique() == 0:
         return None, None
-    game_id = rows['GAME_ID'].unique()[0]
-    game_rows = rows[rows['GAME_ID'] == game_id]
-    actual_total = int(game_rows['PTS'].sum())
-    actual_winner = game_rows.loc[game_rows['PTS'].idxmax()]['TEAM_NAME']
+    game_id = rows["GAME_ID"].unique()[0]
+    game_rows = rows[rows["GAME_ID"] == game_id]
+    actual_total = int(game_rows["PTS"].sum())
+    actual_winner = game_rows.loc[game_rows["PTS"].idxmax()]["TEAM_NAME"]
     return actual_total, actual_winner
+
+# --- Player Prediction Helpers ---
+def get_player_data(name, season="2024-25"):
+    player_dict = players.find_players_by_full_name(name)
+    if not player_dict:
+        return None, None
+    player_id = player_dict[0]["id"]
+    gamelog = playergamelog.PlayerGameLog(player_id=player_id, season=season)
+    df = gamelog.get_data_frames()[0]
+    if df.empty:
+        return player_id, df
+    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+    df = df.sort_values("GAME_DATE")
+    df["days_rest"] = df["GAME_DATE"].diff().dt.days
+    return player_id, df[["GAME_DATE", "MATCHUP", "PTS", "REB", "AST", "days_rest"]]
+
+def get_player_advanced(player_id, season="2024-25"):
+    dash = playerdashboardbygeneralsplits.PlayerDashboardByGeneralSplits(
+        player_id=player_id, season=season, season_type_all_star="Regular Season"
+    )
+    df = dash.overall_player_dashboard.get_data_frame()
+    return df[["DEF_RATING", "PACE", "USG_PCT"]].iloc[0]
+
+def prepare_features(df, player_adv, opp_def_rating):
+    df["PTS_last5"] = df["PTS"].rolling(5).mean().shift(1)
+    df["is_home"] = df["MATCHUP"].str.contains("vs").astype(int)
+    df["opp_def_rating"] = opp_def_rating
+    df["player_def_rating"] = player_adv["DEF_RATING"]
+    df["pace"] = player_adv["PACE"]
+    df["usage"] = player_adv["USG_PCT"]
+    df = df.dropna()
+    X = df[["PTS_last5", "is_home", "days_rest", "opp_def_rating", "player_def_rating", "pace", "usage"]]
+    y = df["PTS"]
+    return X, y
+
+def predict_next_game(name, season="2024-25"):
+    player_id, df = get_player_data(name, season)
+    if player_id is None:
+        return f"No player found for {name}"
+    if df is None or df.empty:
+        return f"No game logs found for {name} ({season})"
+
+    player_adv = get_player_advanced(player_id, season)
+
+    # NOTE: For a production model, compute actual opponent defensive rating for the next matchup.
+    # As a placeholder, use a league-average defensive rating:
+    opp_def_rating = 110.0
+
+    X, y = prepare_features(df, player_adv, opp_def_rating)
+    if X.empty:
+        return f"Not enough data to predict {name}'s next game."
+
+    model = RandomForestRegressor(n_estimators=150, random_state=42)
+    model.fit(X, y)
+
+    latest_features = X.iloc[-1].values.reshape(1, -1)
+    pred_pts = model.predict(latest_features)[0]
+
+    rest_days = int(df["days_rest"].iloc[-1]) if pd.notnull(df["days_rest"].iloc[-1]) else 0
+
+    return (
+        f"{name} predicted points next game: {pred_pts:.1f}\n"
+        f"(Player DEF Rating: {player_adv['DEF_RATING']:.1f}, Pace: {player_adv['PACE']:.1f}, "
+        f"Usage: {player_adv['USG_PCT']:.1f}%, Rest: {rest_days} days)"
+    )
 
 # --- Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -138,7 +212,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "/today → predictions vs Vegas + winner probabilities\n"
         "/results → check yesterday’s accuracy\n"
-        "/summary → overall accuracy stats"
+        "/summary → overall accuracy stats\n"
+        "/predict_player <name> → predict player points"
     )
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -150,17 +225,17 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     output_lines = []
     for game in vegas_data:
-        home_team = game.get('home_team')
-        away_team = game.get('away_team')
+        home_team = game.get("home_team")
+        away_team = game.get("away_team")
         if not home_team or not away_team:
             continue
 
         # Pull a totals line from any bookmaker
         odds_line = None
-        for bookie in game.get('bookmakers', []):
-            for market in bookie.get('markets', []):
-                if market.get('key') == 'totals' and market.get('outcomes'):
-                    point = market['outcomes'][0].get('point')
+        for bookie in game.get("bookmakers", []):
+            for market in bookie.get("markets", []):
+                if market.get("key") == "totals" and market.get("outcomes"):
+                    point = market["outcomes"][0].get("point")
                     if point is not None:
                         odds_line = float(point)
                         break
@@ -193,7 +268,7 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "vegas_line": odds_line,
             "checked": False,
             "totals_correct": None,
-            "winner_correct": None
+            "winner_correct": None,
         }
 
         line = (
@@ -218,20 +293,19 @@ async def results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     checked = 0
 
     for key, pred in predictions_log.items():
-        home_team = pred['home_team']
-        away_team = pred['away_team']
+        home_team = pred["home_team"]
+        away_team = pred["away_team"]
 
         actual_total, actual_winner = compute_actuals_for_matchup(df_day, home_team, away_team)
         if actual_total is None:
             continue
 
         correct_total = (
-            (pred['pred_total'] > pred['vegas_line'] and actual_total > pred['vegas_line']) or
-            (pred['pred_total'] < pred['vegas_line'] and actual_total < pred['vegas_line'])
+            (pred["pred_total"] > pred["vegas_line"] and actual_total > pred["vegas_line"]) or
+            (pred["pred_total"] < pred["vegas_line"] and actual_total < pred["vegas_line"])
         )
-        correct_winner = (pred['pred_winner'] == actual_winner)
+        correct_winner = (pred["pred_winner"] == actual_winner)
 
-        # Save evaluation
         pred["checked"] = True
         pred["totals_correct"] = bool(correct_total)
         pred["winner_correct"] = bool(correct_winner)
@@ -273,6 +347,19 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg)
 
+async def predict_player(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("User %s requested player prediction", update.effective_user.username)
+    if not context.args:
+        await update.message.reply_text("Usage: /predict_player <name>")
+        return
+    name = " ".join(context.args)
+    try:
+        result = predict_next_game(name)
+    except Exception as e:
+        logger.error("Player prediction error: %s", e)
+        result = f"Could not predict for {name}."
+    await update.message.reply_text(result)
+
 # --- Error handler ---
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Exception while handling update %s: %s", update, context.error)
@@ -289,6 +376,7 @@ def main():
     app.add_handler(CommandHandler("today", today))
     app.add_handler(CommandHandler("results", results))
     app.add_handler(CommandHandler("summary", summary))
+    app.add_handler(CommandHandler("predict_player", predict_player))
     app.add_error_handler(error_handler)
 
     logger.info("Bot starting polling...")
