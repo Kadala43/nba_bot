@@ -159,8 +159,15 @@ def get_player_advanced(player_id, season="2024-25"):
     dash = playerdashboardbygeneralsplits.PlayerDashboardByGeneralSplits(
     player_id=player_id, season=season
 )
-    df = dash.overall_player_dashboard.get_data_frame()
-    return df[["DEF_RATING", "PACE", "USG_PCT"]].iloc[0]
+    df = dash.get_data_frames()[0]
+expected_cols = ['DEF_RATING', 'PACE', 'USG_PCT']
+missing = [col for col in expected_cols if col not in df.columns]
+
+if missing:
+    logger.warning("Missing columns in player dashboard: %s", missing)
+    return pd.Series({'DEF_RATING': 110, 'PACE': 100, 'USG_PCT': 20})  # fallback values
+
+return df[expected_cols].iloc[0]
 
 def prepare_features(df, player_adv, opp_def_rating):
     df["PTS_last5"] = df["PTS"].rolling(5).mean().shift(1)
