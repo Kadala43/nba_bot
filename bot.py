@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 # --- Config ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
-EDGE_THRESHOLD = 3  # min edge to show OVER/UNDER recommendation
+EDGE_THRESHOLD = 0  # min edge to show OVER/UNDER recommendation
 
 # --- Global caches ---
 odds_cache = {"data": None, "timestamp": 0}
@@ -32,7 +32,7 @@ def build_models():
     gamefinder = leaguegamefinder.LeagueGameFinder(league_id_nullable='00')
     games = gamefinder.get_data_frames()[0]
     games['GAME_DATE'] = pd.to_datetime(games['GAME_DATE'])
-    games = games[games['GAME_DATE'].dt.year >= 2023]
+    games = games[games['GAME_DATE'].dt.year >= 2024]
 
     avg_scores = games.groupby('TEAM_ID')['PTS'].mean().to_dict()
     games_home = games[games['MATCHUP'].str.contains('vs.')].copy()
