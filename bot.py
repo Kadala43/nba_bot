@@ -8,6 +8,11 @@ from nba_api.stats.endpoints import leaguegamefinder
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from nba_api.stats.endpoints import playergamelog
+from nba_api.stats.static import players
+from nba_api.stats.endpoints import commonteamroster
+from nba_api.stats.static import teams
+
 
 # --- Logging ---
 logging.basicConfig(
@@ -130,20 +135,44 @@ def compute_actuals_for_matchup(df_day, home_team, away_team):
     actual_total = int(game_rows['PTS'].sum())
     actual_winner = game_rows.loc[game_rows['PTS'].idxmax()]['TEAM_NAME']
     return actual_total, actual_winner
-def fetch_player_props_for_game(home: str, away: str):
-    url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/odds"
-    params = {
-        "regions": "us",
-        "markets": "player_points,player_rebounds,player_assists",
-        "oddsFormat": "decimal",
-        "apiKey": ODDS_API_KEY,
-        "homeTeam": home,
-        "awayTeam": away
-    }
-    resp = requests.get(url, params=params)
-    if resp.status_code != 200:
+def get_player_id(name: str):
+    # Find player ID by name
+    matches = players.find_players_by_full_name(name)
+    if not matches:
         return None
-    return resp.json()
+    return matches[0]['id']
+
+def expected_line(player_name: str, stat: str = "PTS", season="2025-26"):
+    player_id = get_player_id(player_name)
+    if not player_id:
+        return None
+
+    logs = playergamelog.PlayerGameLog(player_id=player_id, season=season)
+    df = logs.get_data_frames()[0]
+
+    # Season average
+    avg = df[stat].mean()
+
+    # Recent form (last 5 games)
+    last5_avg = df.head(5)[stat].mean()
+
+    # Weighted projection: 70% season avg + 30% recent form
+    expected = 0.7 * avg + 0.3 * last5_avg
+    return round(expected, 1)
+
+def get_team_id(team_name: str):
+    matches = teams.find_teams_by_full_name(team_name)
+    if not matches:
+        return None
+    return matches[0]['id']
+
+def get_team_roster(team_name: str, season="2025-26"):
+    team_id = get_team_id(team_name)
+    if not team_id:
+        return []
+    roster = commonteamroster.CommonTeamRoster(team_id=team_id, season=season)
+    df = roster.get_data_frames()[0]
+    return df['PLAYER'].tolist()
 
 
 # --- Command Handlers ---
@@ -292,7 +321,7 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Exception while handling update %s: %s", update, context.error)
 
-async def props(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def expected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vegas_data = fetch_vegas_odds()
     if not vegas_data:
         await update.message.reply_text("Could not fetch games.")
@@ -304,24 +333,23 @@ async def props(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not home or not away:
             continue
 
-        props_data = fetch_player_props_for_game(home, away)
-        if not props_data:
-            await update.message.reply_text(f"No props found for {away} @ {home}")
-            continue
+        lines = [f"Expected lines for {away} @ {home}:"]
 
-        lines = []
-        for g in props_data:
-            for bookie in g.get("bookmakers", []):
-                for market in bookie.get("markets", []):
-                    for outcome in market.get("outcomes", []):
-                        player = outcome.get("name")
-                        line = outcome.get("point")
-                        lines.append(f"{player} {market['key']}: {line}")
+        for team in [home, away]:
+            roster = get_team_roster(team)
+            if not roster:
+                lines.append(f"No roster found for {team}")
+                continue
 
-        if lines:
-            await update.message.reply_text(
-                f"Props for {away} @ {home}:\n" + "\n".join(lines)
-            )
+            lines.append(f"\n{team}:")
+            for player in roster:
+                pts = expected_line(player, "PTS")
+                reb = expected_line(player, "REB")
+                ast = expected_line(player, "AST")
+                if pts and reb and ast:
+                    lines.append(f"{player}: {pts} PTS, {reb} REB, {ast} AST")
+
+        await update.message.reply_text("\n".join(lines))
 # --- Main ---
 def main():
     if not BOT_TOKEN:
@@ -334,7 +362,7 @@ def main():
     app.add_handler(CommandHandler("today", today))
     app.add_handler(CommandHandler("results", results))
     app.add_handler(CommandHandler("summary", summary))
-    app.add_handler(CommandHandler("props", props))
+    app.add_handler(CommandHandler("expected", expected))
     app.add_error_handler(error_handler)
 
     logger.info("Bot starting polling...")
