@@ -130,6 +130,21 @@ def compute_actuals_for_matchup(df_day, home_team, away_team):
     actual_total = int(game_rows['PTS'].sum())
     actual_winner = game_rows.loc[game_rows['PTS'].idxmax()]['TEAM_NAME']
     return actual_total, actual_winner
+def fetch_player_props_for_game(home: str, away: str):
+    url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/odds"
+    params = {
+        "regions": "us",
+        "markets": "player_points,player_rebounds,player_assists",
+        "oddsFormat": "decimal",
+        "apiKey": ODDS_API_KEY,
+        "homeTeam": home,
+        "awayTeam": away
+    }
+    resp = requests.get(url, params=params)
+    if resp.status_code != 200:
+        return None
+    return resp.json()
+
 
 # --- Command Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -277,6 +292,36 @@ async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Exception while handling update %s: %s", update, context.error)
 
+async def props(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    vegas_data = fetch_vegas_odds()
+    if not vegas_data:
+        await update.message.reply_text("Could not fetch games.")
+        return
+
+    for game in vegas_data:
+        home = game.get("home_team")
+        away = game.get("away_team")
+        if not home or not away:
+            continue
+
+        props_data = fetch_player_props_for_game(home, away)
+        if not props_data:
+            await update.message.reply_text(f"No props found for {away} @ {home}")
+            continue
+
+        lines = []
+        for g in props_data:
+            for bookie in g.get("bookmakers", []):
+                for market in bookie.get("markets", []):
+                    for outcome in market.get("outcomes", []):
+                        player = outcome.get("name")
+                        line = outcome.get("point")
+                        lines.append(f"{player} {market['key']}: {line}")
+
+        if lines:
+            await update.message.reply_text(
+                f"Props for {away} @ {home}:\n" + "\n".join(lines)
+            )
 # --- Main ---
 def main():
     if not BOT_TOKEN:
@@ -289,6 +334,7 @@ def main():
     app.add_handler(CommandHandler("today", today))
     app.add_handler(CommandHandler("results", results))
     app.add_handler(CommandHandler("summary", summary))
+    app.add_handler(CommandHandler("props", props))
     app.add_error_handler(error_handler)
 
     logger.info("Bot starting polling...")
