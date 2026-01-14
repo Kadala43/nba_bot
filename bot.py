@@ -37,7 +37,7 @@ def build_models():
     gamefinder = leaguegamefinder.LeagueGameFinder(league_id_nullable='00')
     games = gamefinder.get_data_frames()[0]
     games['GAME_DATE'] = pd.to_datetime(games['GAME_DATE'])
-    games = games[games['GAME_DATE'].dt.year >= 2024]
+    games = games[games['GAME_DATE'].dt.year >= 2025]
 
     avg_scores = games.groupby('TEAM_ID')['PTS'].mean().to_dict()
     games_home = games[games['MATCHUP'].str.contains('vs.')].copy()
